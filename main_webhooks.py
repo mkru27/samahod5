@@ -90,6 +90,7 @@ class Order:
     description: str
     address: str
     date_str: str
+    status: str = "open"  # open|closed
     created_at: datetime = field(default_factory=datetime.utcnow)
     likes: Set[int] = field(default_factory=set)  # executor user_ids
 
@@ -111,10 +112,10 @@ def valid_by_fmt375(phone: str) -> bool:
     p = (phone or "").replace(" ", "").replace("-", "")
     return p.startswith("+375") and len(p) == 13 and p[1:].isdigit()
 
-async def notify_admins(text: str):
+async def notify_admins(text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
     for aid in ADMIN_IDS:
         try:
-            await dispatcher_bot.send_message(aid, text)
+            await dispatcher_bot.send_message(aid, text, reply_markup=reply_markup)
         except Exception:
             pass
 
@@ -135,6 +136,12 @@ def dispatcher_exec_kb(uid: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⛔ Заблокировать", callback_data=f"dblk:{uid}"),
         ],
         [InlineKeyboardButton(text="ℹ️ Подробности", callback_data=f"dinfo:{uid}")]
+    ])
+
+def dispatcher_order_kb(oid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Разослать ещё раз", callback_data=f"dord:resend:{oid}")],
+        [InlineKeyboardButton(text="❌ Закрыть заявку", callback_data=f"dord:close:{oid}")],
     ])
 
 # ===================== CUSTOMER BOT =====================
@@ -289,8 +296,19 @@ async def cb_new_date(c: CallbackQuery, state: FSMContext):
     )
     await state.clear(); await c.answer()
 
-    # разослать в ProBot по категории
+    # 1) разослать в ProBot по категории
     await send_order_to_executors(order_id)
+
+    # 2) всегда уведомить диспетчера (+ кнопки)
+    text_admin = (
+        f"🆕 *Новая заявка #{order_id}*\n"
+        f"Категория: *{category}*\n"
+        f"Дата: *{date_str}*\n"
+        f"Адрес: {address}\n"
+        f"Описание: {description}\n"
+        f"Клиент: *{phone}*"
+    )
+    await notify_admins(text_admin, reply_markup=dispatcher_order_kb(order_id))
 
 # ===================== PRO BOT (исполнители) =====================
 class ProReg(StatesGroup):
@@ -329,7 +347,6 @@ async def pro_start(m: Message, state: FSMContext):
     try:
         await m.answer(f"Привет! Статус: *{status}*.\nМеню ниже.", reply_markup=pro_main_menu(ex))
     except Exception:
-        # редкий сетевой таймаут к Telegram — игнорируем, чтобы не ронять обработчик
         pass
 
 @r_pro.message(ProReg.waiting_name)
@@ -434,6 +451,8 @@ async def pro_take(c: CallbackQuery):
     o = ORDERS.get(oid)
     if not o:
         await c.answer("Заявка недоступна", show_alert=True); return
+    if o.status != "open":
+        await c.answer("Заявка закрыта", show_alert=True); return
 
     ex = EXECUTORS.get(c.from_user.id)
     if not ex or ex.status != "approved":
@@ -571,10 +590,42 @@ async def d_cb_info(c: CallbackQuery):
     await c.message.answer(text, reply_markup=dispatcher_exec_kb(uid))
     await c.answer()
 
+# ---- Кнопки по заявкам у диспетчера ----
+@r_dispatcher.callback_query(F.data.startswith("dord:resend:"))
+async def d_order_resend(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        await c.answer("Нет доступа", show_alert=True); return
+    oid = int(c.data.split(":")[2])
+    o = ORDERS.get(oid)
+    if not o:
+        await c.answer("Заявка не найдена", show_alert=True); return
+    if o.status != "open":
+        await c.answer("Заявка закрыта", show_alert=True); return
+    await send_order_to_executors(oid)
+    await c.answer("Переотправили исполнителям")
+
+@r_dispatcher.callback_query(F.data.startswith("dord:close:"))
+async def d_order_close(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        await c.answer("Нет доступа", show_alert=True); return
+    oid = int(c.data.split(":")[2])
+    o = ORDERS.get(oid)
+    if not o:
+        await c.answer("Заявка не найдена", show_alert=True); return
+    o.status = "closed"
+    try:
+        await c.message.edit_text(f"❎ Заявка #{oid} закрыта.\nКлиент: *{o.customer_phone}*")
+    except Exception:
+        pass
+    await c.answer("Заявка закрыта")
+
 # ===================== GLUE: SEND ORDER TO EXECUTORS =====================
 async def send_order_to_executors(order_id: int):
     o = ORDERS.get(order_id)
-    if not o: return
+    if not o:
+        return
+    if o.status != "open":
+        return
     # Находим одобренных исполнителей с подходящей категорией
     targets = [e for e in EXECUTORS.values() if e.status == "approved" and o.category in e.categories]
     if not targets:
@@ -591,7 +642,6 @@ async def send_order_to_executors(order_id: int):
             await pro_bot.send_message(ex.user_id, text, reply_markup=kb)
             sent += 1
         except Exception:
-            # пользователь не нажал Start у ProBot — пропускаем
             pass
     if sent == 0:
         await notify_admins(
@@ -657,7 +707,6 @@ async def setup_webhooks():
                 await asyncio.sleep(2 * (attempt + 1))
         print(f"FAILED to set webhook for {path} after retries")
 
-    # запуск параллельно, не валим приложение из-за таймаутов Telegram
     await asyncio.gather(
         set_for(customer_bot, "/tg/customer"),
         set_for(pro_bot, "/tg/pro"),
@@ -666,10 +715,8 @@ async def setup_webhooks():
 
 @app.on_event("startup")
 async def on_startup():
-    # НЕ ждём ответа Telegram — ставим вебхуки в фоне, чтобы стартап не падал
     asyncio.create_task(setup_webhooks())
 
-# Ручной ресет вебхуков (если меняли домен)
 @app.post("/setup")
 async def manual_setup(request: Request):
     key = request.query_params.get("key", "")
