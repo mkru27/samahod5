@@ -128,6 +128,15 @@ def chunk_buttons(items: List[str], prefix: str, per_row: int = 2) -> List[List[
         rows.append(row)
     return rows
 
+def dispatcher_exec_kb(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"dapp:{uid}"),
+            InlineKeyboardButton(text="⛔ Заблокировать", callback_data=f"dblk:{uid}"),
+        ],
+        [InlineKeyboardButton(text="ℹ️ Подробности", callback_data=f"dinfo:{uid}")]
+    ])
+
 # ===================== CUSTOMER BOT =====================
 class CBNewOrder(StatesGroup):
     waiting_phone = State()
@@ -362,11 +371,19 @@ async def pro_cats_ok(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await c.message.answer("Спасибо! Заявка на регистрацию отправлена диспетчеру. Ожидайте одобрения.")
     who = mention(c.from_user.id, c.from_user.username, c.from_user.full_name or name)
-    await notify_admins(
+
+    text = (
         "🆕 *Новая регистрация исполнителя*\n"
         f"{who}\nТелефон: *{phone}*\nКатегории: {', '.join(sorted(selected))}\n"
-        f"Одобрить: /exec_approve {c.from_user.id}\nЗаблокировать: /exec_block {c.from_user.id}"
+        f"user_id: `{c.from_user.id}`"
     )
+    kb = dispatcher_exec_kb(c.from_user.id)
+    for aid in ADMIN_IDS:
+        try:
+            await dispatcher_bot.send_message(aid, text, reply_markup=kb)
+        except Exception:
+            pass
+
     await c.answer()
 
 @r_pro.callback_query(F.data == "pro:cats")
@@ -449,19 +466,27 @@ async def d_start(m: Message):
     if m.from_user.id not in ADMIN_IDS:
         await m.answer("Нет доступа."); return
     await m.answer("Панель диспетчера.\nКоманды:\n"
-                   "/exec_list — список исполнителей\n"
+                   "/exec_list — список исполнителей (карточками)\n"
                    "/exec_approve <id>\n/exec_block <id>\n/exec_info <id>")
 
 @r_dispatcher.message(Command("exec_list"))
 async def d_exec_list(m: Message):
-    if m.from_user.id not in ADMIN_IDS: return
-    pending = [e for e in EXECUTORS.values() if e.status == "pending"]
-    approved = [e for e in EXECUTORS.values() if e.status == "approved"]
-    blocked = [e for e in EXECUTORS.values() if e.status == "blocked"]
-    def fmt(lst: List[Executor], title: str) -> str:
-        if not lst: return f"{title}: —"
-        return f"{title} ({len(lst)}):\n" + "\n".join([f"• {e.user_id} {e.name} {e.phone}" for e in lst])
-    await m.answer("\n\n".join([fmt(pending, "Ожидают"), fmt(approved, "Одобренные"), fmt(blocked, "Заблокированные")]))
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    if not EXECUTORS:
+        await m.answer("Исполнителей пока нет."); return
+
+    # Сводка
+    pending = sum(1 for e in EXECUTORS.values() if e.status == "pending")
+    approved = sum(1 for e in EXECUTORS.values() if e.status == "approved")
+    blocked = sum(1 for e in EXECUTORS.values() if e.status == "blocked")
+    await m.answer(f"Всего: {len(EXECUTORS)}\nОжидают: {pending}\nОдобрены: {approved}\nЗаблокированы: {blocked}")
+
+    # Карточки по одному сообщению
+    for e in EXECUTORS.values():
+        cats = ", ".join(sorted(e.categories)) or "—"
+        text = f"*{e.name}* (id `{e.user_id}`)\nТел.: *{e.phone}*\nКатегории: {cats}\nСтатус: {e.status}"
+        await m.answer(text, reply_markup=dispatcher_exec_kb(e.user_id))
 
 @r_dispatcher.message(Command("exec_approve"))
 async def d_exec_approve(m: Message):
@@ -495,8 +520,56 @@ async def d_exec_info(m: Message):
     if not ex: await m.answer("Исполнитель не найден"); return
     await m.answer(
         f"*{ex.name}* (id {ex.user_id})\nТел.: *{ex.phone}*\n"
-        f"Категории: {', '.join(sorted(ex.categories)) or '—'}\nСтатус: {ex.status}"
+        f"Категории: {', '.join(sorted(ex.categories)) or '—'}\nСтатус: {ex.status}",
+        reply_markup=dispatcher_exec_kb(uid)
     )
+
+@r_dispatcher.callback_query(F.data.startswith("dapp:"))
+async def d_cb_approve(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        await c.answer("Нет доступа", show_alert=True); return
+    uid = int(c.data.split(":", 1)[1])
+    ex = EXECUTORS.get(uid)
+    if not ex:
+        await c.answer("Исполнитель не найден", show_alert=True); return
+    ex.status = "approved"
+    await c.answer("Одобрено")
+    try:
+        await c.message.edit_text(f"✅ Одобрен: {uid} {ex.name} {ex.phone}")
+    except Exception:
+        pass
+
+@r_dispatcher.callback_query(F.data.startswith("dblk:"))
+async def d_cb_block(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        await c.answer("Нет доступа", show_alert=True); return
+    uid = int(c.data.split(":", 1)[1])
+    ex = EXECUTORS.get(uid)
+    if not ex:
+        await c.answer("Исполнитель не найден", show_alert=True); return
+    ex.status = "blocked"
+    await c.answer("Заблокирован")
+    try:
+        await c.message.edit_text(f"⛔ Заблокирован: {uid} {ex.name} {ex.phone}")
+    except Exception:
+        pass
+
+@r_dispatcher.callback_query(F.data.startswith("dinfo:"))
+async def d_cb_info(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        await c.answer("Нет доступа", show_alert=True); return
+    uid = int(c.data.split(":", 1)[1])
+    ex = EXECUTORS.get(uid)
+    if not ex:
+        await c.answer("Исполнитель не найден", show_alert=True); return
+    text = (
+        f"*{ex.name}* (id {ex.user_id})\n"
+        f"Тел.: *{ex.phone}*\n"
+        f"Категории: {', '.join(sorted(ex.categories)) or '—'}\n"
+        f"Статус: {ex.status}"
+    )
+    await c.message.answer(text, reply_markup=dispatcher_exec_kb(uid))
+    await c.answer()
 
 # ===================== GLUE: SEND ORDER TO EXECUTORS =====================
 async def send_order_to_executors(order_id: int):
@@ -584,7 +657,7 @@ async def setup_webhooks():
                 await asyncio.sleep(2 * (attempt + 1))
         print(f"FAILED to set webhook for {path} after retries")
 
-    # запустим параллельно и НЕ будем падать из-за таймаутов
+    # запуск параллельно, не валим приложение из-за таймаутов Telegram
     await asyncio.gather(
         set_for(customer_bot, "/tg/customer"),
         set_for(pro_bot, "/tg/pro"),
