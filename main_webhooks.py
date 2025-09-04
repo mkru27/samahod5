@@ -1,4 +1,5 @@
 import os
+import html
 import asyncio
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set, List
@@ -108,6 +109,10 @@ def next_order_id() -> int:
 def mention(uid: int, username: Optional[str], full_name: str) -> str:
     return f"@{username}" if username else f"[{full_name}](tg://user?id={uid})"
 
+def mention_html(uid: int, username: Optional[str], full_name: str) -> str:
+    safe = html.escape(full_name or "Пользователь")
+    return f'<a href="tg://user?id={uid}">{safe}</a>'
+
 def valid_by_fmt375(phone: str) -> bool:
     p = (phone or "").replace(" ", "").replace("-", "")
     return p.startswith("+375") and len(p) == 13 and p[1:].isdigit()
@@ -116,7 +121,7 @@ async def notify_admins(text: str, reply_markup: Optional[InlineKeyboardMarkup] 
     errs = []
     for aid in ADMIN_IDS:
         try:
-            await dispatcher_bot.send_message(aid, text, reply_markup=reply_markup)
+            await dispatcher_bot.send_message(aid, text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
         except Exception as e:
             errs.append((aid, repr(e)))
     if errs:
@@ -195,8 +200,9 @@ async def cb_call_phone(m: Message, state: FSMContext):
     if not valid_by_fmt375(phone):
         await m.answer("Пожалуйста, укажите номер в формате `+375XXXXXXXXX` (ровно 9 цифр после +375).")
         return
-    who = mention(m.from_user.id, m.from_user.username, m.from_user.full_name or "Пользователь")
-    await notify_admins(f"📞 *Обратный звонок*\nОт: {who}\nТелефон: *{phone}*")
+    who = mention_html(m.from_user.id, m.from_user.username, m.from_user.full_name or "Пользователь")
+    text = f"📞 <b>Обратный звонок</b>\nОт: {who}\nТелефон: <b>{phone}</b>"
+    await notify_admins(text)
     await state.clear()
     await m.answer("Спасибо! Передали диспетчеру — скоро свяжемся.", reply_markup=cb_main_menu())
 
@@ -304,12 +310,12 @@ async def cb_new_date(c: CallbackQuery, state: FSMContext):
 
     # 2) всегда уведомить диспетчера (+ кнопки)
     text_admin = (
-        f"🆕 *Новая заявка #{order_id}*\n"
-        f"Категория: *{category}*\n"
-        f"Дата: *{date_str}*\n"
-        f"Адрес: {address}\n"
-        f"Описание: {description}\n"
-        f"Клиент: *{phone}*"
+        f"🆕 <b>Новая заявка #{order_id}</b>\n"
+        f"Категория: <b>{html.escape(category)}</b>\n"
+        f"Дата: <b>{html.escape(date_str)}</b>\n"
+        f"Адрес: {html.escape(address)}\n"
+        f"Описание: {html.escape(description)}\n"
+        f"Клиент: <b>{html.escape(phone)}</b>"
     )
     await notify_admins(text_admin, reply_markup=dispatcher_order_kb(order_id))
 
@@ -391,19 +397,16 @@ async def pro_cats_ok(c: CallbackQuery, state: FSMContext):
     )
     await state.clear()
     await c.message.answer("Спасибо! Заявка на регистрацию отправлена диспетчеру. Ожидайте одобрения.")
-    who = mention(c.from_user.id, c.from_user.username, c.from_user.full_name or name)
-
+    who = mention_html(c.from_user.id, c.from_user.username, c.from_user.full_name or name)
+    cats = ", ".join(sorted(selected))
     text = (
-        "🆕 *Новая регистрация исполнителя*\n"
-        f"{who}\nТелефон: *{phone}*\nКатегории: {', '.join(sorted(selected))}\n"
-        f"user_id: `{c.from_user.id}`"
+        "🆕 <b>Новая регистрация исполнителя</b>\n"
+        f"{who}\nТелефон: <b>{phone}</b>\nКатегории: {html.escape(cats)}\n"
+        f"user_id: <code>{c.from_user.id}</code>"
     )
-
-    # 1-я попытка — с кнопками
     try:
         await notify_admins(text, reply_markup=dispatcher_exec_kb(c.from_user.id))
     except Exception:
-        # 2-я попытка — без кнопок
         await notify_admins(text)
 
     await c.answer()
@@ -464,11 +467,15 @@ async def pro_take(c: CallbackQuery):
         await c.answer("Доступ только для одобренных исполнителей", show_alert=True); return
 
     o.likes.add(c.from_user.id)
-    who = mention(c.from_user.id, c.from_user.username, c.from_user.full_name or ex.name)
+    who = mention_html(c.from_user.id, c.from_user.username, c.from_user.full_name or ex.name)
     await notify_admins(
-        f"✅ *Отклик (LIKE)* по заявке #{o.id} [{o.category}]\n"
-        f"Исполнитель: {who}\nТел.: *{ex.phone}*\n"
-        f"Клиент: *{o.customer_phone}*\nАдрес: {o.address}\nДата: {o.date_str}\nОписание: {o.description}"
+        "✅ <b>Отклик (LIKE)</b> по заявке "
+        f"#{o.id} [<b>{html.escape(o.category)}</b>]\n"
+        f"Исполнитель: {who}\nТел.: <b>{html.escape(ex.phone)}</b>\n"
+        f"Клиент: <b>{html.escape(o.customer_phone)}</b>\n"
+        f"Адрес: {html.escape(o.address)}\n"
+        f"Дата: <b>{html.escape(o.date_str)}</b>\n"
+        f"Описание: {html.escape(o.description)}"
     )
     await c.answer("Принято! Диспетчер с вами свяжется.")
     try:
@@ -635,8 +642,8 @@ async def send_order_to_executors(order_id: int):
     targets = [e for e in EXECUTORS.values() if e.status == "approved" and o.category in e.categories]
     if not targets:
         await notify_admins(
-            f"⚠️ Нет одобренных исполнителей по категории [{o.category}] для заявки #{o.id}.\n"
-            f"Клиент: *{o.customer_phone}* — позвоните вручную."
+            f"⚠️ Нет одобренных исполнителей по категории [<b>{html.escape(o.category)}</b>] для заявки #{o.id}.\n"
+            f"Клиент: <b>{html.escape(o.customer_phone)}</b> — позвоните вручную."
         )
         return
     text = order_card_text(o)
@@ -650,7 +657,8 @@ async def send_order_to_executors(order_id: int):
             pass
     if sent == 0:
         await notify_admins(
-            f"⚠️ Ни одному исполнителю не доставлено в личку (никто не нажал Start у ProBot) по заявке #{o.id} [{o.category}]."
+            f"⚠️ Ни одному исполнителю не доставлено в личку (никто не нажал Start у ProBot) по заявке #{o.id} "
+            f"[<b>{html.escape(o.category)}</b>]."
         )
 
 # ===================== FASTAPI APP + WEBHOOKS =====================
@@ -722,6 +730,8 @@ async def setup_webhooks():
 async def on_startup():
     asyncio.create_task(setup_webhooks())
 
+# Поддержим и GET и POST для удобства
+@app.get("/setup")
 @app.post("/setup")
 async def manual_setup(request: Request):
     key = request.query_params.get("key", "")
