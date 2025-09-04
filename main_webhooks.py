@@ -1,7 +1,7 @@
 import os
 import asyncio
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set, List, Tuple
+from typing import Dict, Optional, Set, List
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
@@ -10,12 +10,18 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import ClientTimeout
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Update
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    Update,
+)
 
 # ===================== CONFIG =====================
 load_dotenv()
@@ -29,15 +35,20 @@ if not (CUSTOMER_BOT_TOKEN and PRO_BOT_TOKEN and DISPATCHER_BOT_TOKEN):
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 SUPPORT_PHONE = os.getenv("SUPPORT_PHONE", "+37529XXXXXXX")
 
-BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL")  # e.g., https://your-service.onrender.com
+BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL")  # e.g., https://your-app.onrender.com
 if not BASE_WEBHOOK_URL:
-    raise RuntimeError("Set BASE_WEBHOOK_URL to your public Render URL (e.g. https://appname.onrender.com)")
+    raise RuntimeError("Set BASE_WEBHOOK_URL (e.g. https://<your-app>.onrender.com)")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional but recommended
 
-# Bots
-customer_bot   = Bot(CUSTOMER_BOT_TOKEN,   default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
-pro_bot        = Bot(PRO_BOT_TOKEN,        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
-dispatcher_bot = Bot(DISPATCHER_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+# Bots with longer HTTP timeouts (to reduce sporadic timeouts on free hosting)
+def make_bot(token: str) -> Bot:
+    timeout = ClientTimeout(total=25, connect=10, sock_read=25)
+    session = AiohttpSession(timeout=timeout)
+    return Bot(token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+
+customer_bot   = make_bot(CUSTOMER_BOT_TOKEN)
+pro_bot        = make_bot(PRO_BOT_TOKEN)
+dispatcher_bot = make_bot(DISPATCHER_BOT_TOKEN)
 
 # Dispatchers (раздельные FSM/хэндлеры)
 dp_customer   = Dispatcher(storage=MemoryStorage())
@@ -291,7 +302,6 @@ def cats_keyboard(selected: Set[str]) -> InlineKeyboardMarkup:
     for c in CATEGORIES:
         mark = "✅ " if c in selected else ""
         rows.append([InlineKeyboardButton(text=f"{mark}{c}", callback_data=f"procat:{c}")])
-        rows.append([InlineKeyboardButton(text="Готово", callback_data="pro:cats_ok")]) if False else None
     rows.append([InlineKeyboardButton(text="Готово", callback_data="pro:cats_ok")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -307,7 +317,11 @@ async def pro_start(m: Message, state: FSMContext):
 
     ex = EXECUTORS.get(m.from_user.id)
     status = ex.status if ex else "не зарегистрирован"
-    await m.answer(f"Привет! Статус: *{status}*.\nМеню ниже.", reply_markup=pro_main_menu(ex))
+    try:
+        await m.answer(f"Привет! Статус: *{status}*.\nМеню ниже.", reply_markup=pro_main_menu(ex))
+    except Exception:
+        # редкий сетевой таймаут к Telegram — игнорируем, чтобы не ронять обработчик
+        pass
 
 @r_pro.message(ProReg.waiting_name)
 async def pro_reg_name(m: Message, state: FSMContext):
@@ -514,6 +528,10 @@ async def send_order_to_executors(order_id: int):
 # ===================== FASTAPI APP + WEBHOOKS =====================
 app = FastAPI()
 
+@app.get("/")
+async def root():
+    return PlainTextResponse("OK")
+
 def check_secret(request: Request):
     if not WEBHOOK_SECRET:
         return
@@ -550,24 +568,39 @@ async def tg_dispatcher(request: Request):
     return JSONResponse({"ok": True})
 
 async def setup_webhooks():
-    # Remove existing, then set new webhooks for each bot
-    await customer_bot.delete_webhook(drop_pending_updates=True)
-    await pro_bot.delete_webhook(drop_pending_updates=True)
-    await dispatcher_bot.delete_webhook(drop_pending_updates=True)
+    async def set_for(bot: Bot, path: str):
+        url = f"{BASE_WEBHOOK_URL.rstrip('/')}{path}"
+        for attempt in range(5):
+            try:
+                try:
+                    await bot.delete_webhook(drop_pending_updates=True)
+                except Exception as e:
+                    print(f"delete_webhook error for {path}: {e}")
+                await bot.set_webhook(url, secret_token=WEBHOOK_SECRET or None)
+                print(f"Webhook set: {path} -> {url}")
+                return
+            except Exception as e:
+                print(f"set_webhook attempt {attempt+1} failed for {path}: {e}")
+                await asyncio.sleep(2 * (attempt + 1))
+        print(f"FAILED to set webhook for {path} after retries")
 
-    await customer_bot.set_webhook(f"{BASE_WEBHOOK_URL}/tg/customer", secret_token=WEBHOOK_SECRET or None)
-    await pro_bot.set_webhook(f"{BASE_WEBHOOK_URL}/tg/pro", secret_token=WEBHOOK_SECRET or None)
-    await dispatcher_bot.set_webhook(f"{BASE_WEBHOOK_URL}/tg/dispatcher", secret_token=WEBHOOK_SECRET or None)
+    # запустим параллельно и НЕ будем падать из-за таймаутов
+    await asyncio.gather(
+        set_for(customer_bot, "/tg/customer"),
+        set_for(pro_bot, "/tg/pro"),
+        set_for(dispatcher_bot, "/tg/dispatcher"),
+    )
 
 @app.on_event("startup")
 async def on_startup():
-    await setup_webhooks()
+    # НЕ ждём ответа Telegram — ставим вебхуки в фоне, чтобы стартап не падал
+    asyncio.create_task(setup_webhooks())
 
-# Optional: manual reset endpoint (protect via secret in query)
+# Ручной ресет вебхуков (если меняли домен)
 @app.post("/setup")
 async def manual_setup(request: Request):
     key = request.query_params.get("key", "")
     if WEBHOOK_SECRET and key != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
-    await setup_webhooks()
-    return PlainTextResponse("webhooks set")
+    asyncio.create_task(setup_webhooks())
+    return PlainTextResponse("webhooks scheduled")
