@@ -113,11 +113,14 @@ def valid_by_fmt375(phone: str) -> bool:
     return p.startswith("+375") and len(p) == 13 and p[1:].isdigit()
 
 async def notify_admins(text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
+    errs = []
     for aid in ADMIN_IDS:
         try:
             await dispatcher_bot.send_message(aid, text, reply_markup=reply_markup)
-        except Exception:
-            pass
+        except Exception as e:
+            errs.append((aid, repr(e)))
+    if errs:
+        print("notify_admins errors:", errs)
 
 def chunk_buttons(items: List[str], prefix: str, per_row: int = 2) -> List[List[InlineKeyboardButton]]:
     rows, row = [], []
@@ -382,6 +385,7 @@ async def pro_cats_ok(c: CallbackQuery, state: FSMContext):
     name = data["name"]; phone = data["phone"]; selected = set(data.get("selected") or [])
     if not selected:
         await c.answer("Выберите хотя бы одну категорию", show_alert=True); return
+
     EXECUTORS[c.from_user.id] = Executor(
         user_id=c.from_user.id, name=name, phone=phone, categories=selected, status="pending"
     )
@@ -394,12 +398,13 @@ async def pro_cats_ok(c: CallbackQuery, state: FSMContext):
         f"{who}\nТелефон: *{phone}*\nКатегории: {', '.join(sorted(selected))}\n"
         f"user_id: `{c.from_user.id}`"
     )
-    kb = dispatcher_exec_kb(c.from_user.id)
-    for aid in ADMIN_IDS:
-        try:
-            await dispatcher_bot.send_message(aid, text, reply_markup=kb)
-        except Exception:
-            pass
+
+    # 1-я попытка — с кнопками
+    try:
+        await notify_admins(text, reply_markup=dispatcher_exec_kb(c.from_user.id))
+    except Exception:
+        # 2-я попытка — без кнопок
+        await notify_admins(text)
 
     await c.answer()
 
@@ -604,7 +609,7 @@ async def d_order_resend(c: CallbackQuery):
     await send_order_to_executors(oid)
     await c.answer("Переотправили исполнителям")
 
-@r_dispatcher.callback_query(F.data.startswith("dord:close:"))
+@r_dispatcher.callback_query(F.data.startswith("dord:close"))
 async def d_order_close(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS:
         await c.answer("Нет доступа", show_alert=True); return
